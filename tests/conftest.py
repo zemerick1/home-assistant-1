@@ -8,7 +8,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests_mock as _requests_mock
 
-from homeassistant import util
+from homeassistant import core, util
 from homeassistant.util import location
 from homeassistant.auth.const import GROUP_ID_ADMIN, GROUP_ID_READ_ONLY
 from homeassistant.auth.providers import legacy_api_password, homeassistant
@@ -71,11 +71,21 @@ def hass_storage():
 @pytest.fixture
 def hass(loop, hass_storage):
     """Fixture to provide a test instance of HASS."""
+    exception = False
+
+    def async_loop_exception_handler(*args) -> None:
+        """Handle all exception inside the core loop."""
+        nonlocal exception
+        exception = True
+        core.async_loop_exception_handler(*args)
+
     hass = loop.run_until_complete(async_test_home_assistant(loop))
+    hass.loop.set_exception_handler(async_loop_exception_handler)
 
     yield hass
 
     loop.run_until_complete(hass.async_stop(force=True))
+    assert not exception, 'Uncaught exception in test'
 
 
 @pytest.fixture
