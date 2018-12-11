@@ -10,6 +10,7 @@ import collections
 from contextlib import suppress
 from datetime import timedelta
 import logging
+from typing import List, Optional
 import hashlib
 from random import SystemRandom
 
@@ -18,6 +19,7 @@ from aiohttp import web
 import async_timeout
 import voluptuous as vol
 
+from homeassistant.auth.util import generate_secret
 from homeassistant.core import callback
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, \
     SERVICE_TURN_ON
@@ -27,11 +29,16 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_component import EntityComponent
 from homeassistant.helpers.config_validation import PLATFORM_SCHEMA  # noqa
 from homeassistant.components.http import HomeAssistantView, KEY_AUTHENTICATED
+from homeassistant.components.ffmpeg import DATA_FFMPEG
 from homeassistant.components import websocket_api
 import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.aiohttp_client import (
+    async_aiohttp_proxy_stream)
+from homeassistant.util import dt as dt_util
 
 DOMAIN = 'camera'
-DEPENDENCIES = ['http']
+DEPENDENCIES = ['http', 'ffmpeg']
+DATA_STREAMS = 'camera_streams'
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -83,6 +90,17 @@ class Image:
     content = attr.ib(type=bytes)
 
 
+@attr.s
+class StreamProfile:
+    """Represents an ffmpeg stream profile."""
+
+    cmd = attr.ib(type=List[str])
+    input_source = attr.ib(type=str)
+    output = attr.ib(type=str)
+    content_type = attr.ib(type=str)
+    extra_cmd = attr.ib(type=Optional[str], default=None)
+
+
 @bind_hass
 async def async_get_image(hass, entity_id, timeout=10):
     """Fetch an image from a camera entity."""
@@ -104,6 +122,25 @@ async def async_get_mjpeg_stream(hass, request, entity_id):
     camera = _get_camera_from_entity_id(hass, entity_id)
 
     return await camera.handle_async_mjpeg_stream(request)
+
+
+# Temp method
+# In the future we should replace this method with one that takes
+# a camera entity_id to define the input source and commands and
+# an output profile, like Chrome, Firefox, Safari or Cast:
+#
+# def async_prepare_ffmpeg_stream(hass, entity_id, output_profile):
+#
+# We don't want users to be able to control what we send to ffmpeg.
+@bind_hass
+def async_prepare_ffmpeg_stream(hass, cmd, input_source, output, content_type,
+                                extra_cmd=None):
+    """Prepare a stream to be accessed via a webview."""
+    secret = generate_secret()
+    stream_info = StreamProfile(
+        cmd, input_source, output, content_type, extra_cmd)
+    hass.data[DATA_STREAMS][secret] = stream_info
+    return secret
 
 
 async def async_get_still_stream(request, image_cb, content_type, interval):
@@ -168,9 +205,11 @@ async def async_setup(hass, config):
     """Set up the camera component."""
     component = hass.data[DOMAIN] = \
         EntityComponent(_LOGGER, DOMAIN, hass, SCAN_INTERVAL)
+    hass.data[DATA_STREAMS] = {}
 
     hass.http.register_view(CameraImageView(component))
     hass.http.register_view(CameraMjpegStream(component))
+    hass.http.register_view(FFmpegView())
     hass.components.websocket_api.async_register_command(
         WS_TYPE_CAMERA_THUMBNAIL, websocket_camera_thumbnail,
         SCHEMA_WS_CAMERA_THUMBNAIL
@@ -434,7 +473,7 @@ class CameraMjpegStream(CameraView):
     """Camera View to serve an MJPEG stream."""
 
     url = '/api/camera_proxy_stream/{entity_id}'
-    name = 'api:camera:stream'
+    name = 'api:camera:proxy_stream'
 
     async def handle(self, request, camera):
         """Serve camera stream, possibly with interval."""
@@ -499,3 +538,47 @@ async def async_handle_snapshot_service(camera, service):
             _write_image, snapshot_file, image)
     except OSError as err:
         _LOGGER.error("Can't write image to file: %s", err)
+
+
+class FFmpegView(HomeAssistantView):
+    """View offering ffmpeg streams."""
+
+    requires_auth = False
+    url = '/api/camera_stream/{stream_id}'
+    name = 'api:camera:stream'
+
+    async def get(self, request, stream_id):
+        """Serve FFMPEG stream."""
+        from haffmpeg.core import HAFFmpeg
+
+        hass = request.app['hass']
+        stream_info = hass.data[DATA_STREAMS].pop(stream_id, None)
+
+        if stream_info is None:
+            raise web.HTTPNotFound()
+
+        stream = HAFFmpeg(hass.data[DATA_FFMPEG].binary, loop=hass.loop)
+
+        await stream.open(
+            cmd=stream_info.cmd,
+            input_source=stream_info.input_source,
+            output="{} -".format(stream_info.output),
+            extra_cmd=stream_info.extra_cmd
+        )
+
+        try:
+            return await async_aiohttp_proxy_stream(
+                hass, request, stream,
+                stream_info.content_type)
+        finally:
+            await stream.close()
+
+    async def post(self, request, stream_id):
+        """Temporary method to help create stream info objects.
+
+        Test with:
+        curl -X POST --data '{"cmd": "bla", "input_source": "blub", "output": "asd", "content_type": "qqq"}' http://localhost:8123/api/camera_stream/bla
+        """
+        data = await request.json()
+        secret = async_prepare_ffmpeg_stream(request.app['hass'], **data)
+        return secret
