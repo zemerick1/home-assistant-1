@@ -4,7 +4,7 @@ Support for ClearPass Policy Manager.
 Allows tracking devices with CPPM.
 """
 import logging
-from datetime import timedelta
+import time
 
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
@@ -16,8 +16,6 @@ from homeassistant.const import (
 )
 
 REQUIREMENTS = ['clearpasspy==1.1.2']
-
-SCAN_INTERVAL = timedelta(seconds=120)
 
 CLIENT_ID = 'client_id'
 
@@ -70,13 +68,15 @@ class CPPMDeviceScanner(DeviceScanner):
 
     def get_cppm_data(self):
         """Retrieve data from Aruba Clearpass and return parsed result."""
-        endpoints = self._cppm.get_endpoints(100)['_embedded']['items']
+        endpoints = self._cppm.get_endpoints_time(time.time()-600, time.time())
         devices = []
-        for item in endpoints:
-            if self._cppm.online_status(item['mac_address']):
+        for item in endpoints['_embedded']['items']:
+            if item['is_online']:
                 device = {
-                    'mac': item['mac_address'],
-                    'name': item['mac_address']
+                    'mac': item['mac'],
+                    'name': item['device_name'],
+                    'ip': item['ip'],
+                    'device_category': item['device_category']
                 }
                 devices.append(device)
             else:
